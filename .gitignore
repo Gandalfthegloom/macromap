@@ -1,0 +1,113 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extension build artifacts
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller build files
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Django / Flask / other frameworks
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+instance/
+.webassets-cache/
+.scrapy/
+
+# Sphinx and documentation
+docs/_build/
+
+# Virtual environments and local environment files
+.env
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and editor-specific files
+.vscode/
+.idea/
+*.code-workspace
+.spyderproject
+.spyproject
+.ropeproject
+
+# Type checker caches
+.mypy_cache/
+.dmypy.json
+pyre/
+.pyre/
+pytype/
+.pytype/
+cython_debug/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Data artifacts & large file types (specific to your project)
+*.parquet
+*.gexf
+*.csv.gz
+*.pdf
+data/
+gexf/
+parquet/
+
+# Lock / environment management (if used, adapt as needed)
+# Pipenv
+#Pipfile.lock
+# Poetry
+#poetry.lock
+# pdm
+#.pdm.lock
+# Python version management
+.python-version
