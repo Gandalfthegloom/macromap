@@ -102,6 +102,9 @@ data/
 gexf/
 parquet/
 
+# Skip ZIP archives
+*.zip
+
 # Lock / environment management (if used, adapt as needed)
 # Pipenv
 #Pipfile.lock
