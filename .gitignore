@@ -105,6 +105,10 @@ parquet/
 # Skip ZIP archives
 *.zip
 
+# Skip S3 profile
+.env
+access_keys.txt
+
 # Lock / environment management (if used, adapt as needed)
 # Pipenv
 #Pipfile.lock

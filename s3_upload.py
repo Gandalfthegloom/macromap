@@ -15,17 +15,17 @@ Highlights
 
 Examples
   # Preview what would be uploaded (uses default bucket/region/source)
-  python upload_csvgz_to_s3.py --dry-run
+  python s3_upload.py --dry-run
 
   # Upload with a specific AWS profile and overwrite existing keys
-  python upload_csvgz_to_s3.py --profile macromap --overwrite
+  python s3_upload.py --profile your-profile --overwrite
 
   # Custom source folder and a custom prefix
-  python upload_csvgz_to_s3.py --source "D:/world trade/macromap/data/zip/BACI_HS92_V202501/compressed" \
+  python s3_upload.py --source "D:/world trade/macromap/data/zip/BACI_HS92_V202501/compressed" \
       --prefix raw/baci/hs6/
 
   # Normalize filenames to part-0000.csv.gz per year partition
-  python upload_csvgz_to_s3.py --normalize-parts
+  python s3_upload.py --normalize-parts
 """
 
 from __future__ import annotations
@@ -35,21 +35,20 @@ import sys
 import argparse
 from pathlib import Path
 from typing import Iterator, Tuple, Dict, List, Optional
+import configparser
 
 import boto3
 from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
 
 # ----------------------------
-# Configuration & Defaults
+# Built-in Defaults (lowest precedence)
 # ----------------------------
-# Default bucket/region per your environment. Safe to publish :D
 DEFAULT_BUCKET = "macromap-prod-ap-southeast-2"
 DEFAULT_REGION = "ap-southeast-2"
-
-# Default local folder where the compression script writes outputs.
-# You can override with --source if your layout differs.
 DEFAULT_SOURCE = Path(__file__).resolve().parent / "data" / "zip" / "BACI_HS92_V202501" / "compressed"
+DEFAULT_PREFIX = "raw/baci/hs6/"
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("s3_upload.ini")
 
 # Match BACI_HS92_Y<YEAR>_V....csv.gz
 FILENAME_RX = re.compile(r"^BACI_HS92_Y(\d{4})_V.*\.csv\.gz$", re.IGNORECASE)
@@ -86,10 +85,80 @@ class ProgressPrinter:
     def __call__(self, bytes_amount: int) -> None:
         self.seen += bytes_amount
         pct = (self.seen / self.total) * 100 if self.total else 0
-        # Print on the same line (works on most terminals)
         print(f"  → {self.filename}: {self.seen}/{self.total} bytes ({pct:.1f}%)", end="\r", flush=True)
         if self.seen >= self.total:
             print()  # newline on completion
+
+
+# ----------------------------
+# Config loading & precedence
+# ----------------------------
+
+def _to_bool(s: Optional[str], default: bool) -> bool:
+    if s is None:
+        return default
+    return str(s).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def load_config(config_path: Path) -> dict:
+    """Load config values from an INI file. Returns a flat dict of defaults.
+    Missing file returns an empty dict.
+    """
+    if not config_path.exists():
+        return {}
+
+    cp = configparser.ConfigParser()
+    cp.read(config_path, encoding="utf-8")
+
+    cfg = {}
+
+    # [aws]
+    bucket = cp.get("aws", "bucket", fallback=DEFAULT_BUCKET)
+    region = cp.get("aws", "region", fallback=DEFAULT_REGION)
+    profile = cp.get("aws", "profile", fallback=None)
+
+    # [paths]
+    source = cp.get("paths", "source", fallback=str(DEFAULT_SOURCE))
+    prefix = cp.get("paths", "prefix", fallback=DEFAULT_PREFIX)
+
+    # [upload]
+    normalize_parts = _to_bool(cp.get("upload", "normalize_parts", fallback=None), False)
+    overwrite = _to_bool(cp.get("upload", "overwrite", fallback=None), False)
+    dry_run = _to_bool(cp.get("upload", "dry_run", fallback=None), False)
+    storage_class = cp.get("upload", "storage_class", fallback=None) or None
+
+    # [transfer]
+    mth_mb = cp.getint("transfer", "multipart_threshold_mb", fallback=8)
+    mcs_mb = cp.getint("transfer", "multipart_chunksize_mb", fallback=8)
+    max_conc = cp.getint("transfer", "max_concurrency", fallback=8)
+    use_threads = _to_bool(cp.get("transfer", "use_threads", fallback=None), True)
+
+    # [headers]
+    acl = cp.get("headers", "acl", fallback="private")
+    content_type = cp.get("headers", "content_type", fallback="text/csv")
+    content_encoding = cp.get("headers", "content_encoding", fallback="gzip")
+    sse = cp.get("headers", "sse", fallback="AES256")
+
+    cfg.update({
+        "bucket": bucket,
+        "region": region,
+        "profile": profile,
+        "source": source,
+        "prefix": prefix,
+        "normalize_parts": normalize_parts,
+        "overwrite": overwrite,
+        "dry_run": dry_run,
+        "storage_class": storage_class,
+        "multipart_threshold_mb": mth_mb,
+        "multipart_chunksize_mb": mcs_mb,
+        "max_concurrency": max_conc,
+        "use_threads": use_threads,
+        "acl": acl,
+        "content_type": content_type,
+        "content_encoding": content_encoding,
+        "sse": sse,
+    })
+    return cfg
 
 
 # ----------------------------
@@ -137,28 +206,84 @@ def upload_file(s3_client, file_path: Path, bucket: str, key: str, dry_run: bool
 # ----------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload BACI .csv.gz files to S3 with safe defaults.")
-    parser.add_argument("--bucket", default=DEFAULT_BUCKET, help="Target S3 bucket")
-    parser.add_argument("--region", default=DEFAULT_REGION, help="AWS region")
-    parser.add_argument("--profile", default=None, help="AWS profile name (uses default creds if omitted)")
-    parser.add_argument("--source", default=str(DEFAULT_SOURCE), help="Local folder with .csv.gz files")
-    parser.add_argument("--prefix", default="raw/baci/hs6/", help="Key prefix (default: raw/baci/hs6/)")
-    parser.add_argument("--normalize-parts", action="store_true",
+    # Stage 1: parse only --config to know which file to read
+    base_parser = argparse.ArgumentParser(add_help=False)
+    base_parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to INI config file")
+    base_args, _ = base_parser.parse_known_args()
+
+    # Load config (if present) and use it to seed argparse defaults
+    cfg_path = Path(base_args.config)
+    cfg = load_config(cfg_path)
+
+    parser = argparse.ArgumentParser(description="Upload BACI .csv.gz files to S3 with config + safe defaults.",
+                                     parents=[base_parser])
+
+    # Arg defaults come from config (if provided), else built-ins
+    parser.set_defaults(
+        bucket=cfg.get("bucket", DEFAULT_BUCKET),
+        region=cfg.get("region", DEFAULT_REGION),
+        profile=cfg.get("profile", None),
+        source=cfg.get("source", str(DEFAULT_SOURCE)),
+        prefix=cfg.get("prefix", DEFAULT_PREFIX),
+        normalize_parts=cfg.get("normalize_parts", False),
+        overwrite=cfg.get("overwrite", False),
+        dry_run=cfg.get("dry_run", False),
+        storage_class=cfg.get("storage_class", None),
+        multipart_threshold_mb=cfg.get("multipart_threshold_mb", 8),
+        multipart_chunksize_mb=cfg.get("multipart_chunksize_mb", 8),
+        max_concurrency=cfg.get("max_concurrency", 8),
+        use_threads=cfg.get("use_threads", True),
+        acl=cfg.get("acl", "private"),
+        content_type=cfg.get("content_type", "text/csv"),
+        content_encoding=cfg.get("content_encoding", "gzip"),
+        sse=cfg.get("sse", "AES256"),
+    )
+
+    # Full CLI
+    parser.add_argument("--bucket", help="Target S3 bucket")
+    parser.add_argument("--region", help="AWS region")
+    parser.add_argument("--profile", help="AWS profile name (uses default creds if omitted)")
+    parser.add_argument("--source", help="Local folder with .csv.gz files")
+    parser.add_argument("--prefix", help="Key prefix (e.g., raw/baci/hs6/)")
+    parser.add_argument("--normalize-parts", dest="normalize_parts", action="store_true",
                         help="Normalize filenames to part-0000.csv.gz per year")
+    parser.add_argument("--no-normalize-parts", dest="normalize_parts", action="store_false",
+                        help="Use original filenames (default)")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing objects if present")
+    parser.add_argument("--no-overwrite", dest="overwrite", action="store_false",
+                        help="Do not overwrite existing objects")
     parser.add_argument("--dry-run", action="store_true", help="Preview uploads without sending data")
-    parser.add_argument("--storage-class", default=None,
-                        choices=[
-                            "STANDARD", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING",
-                            "REDUCED_REDUNDANCY", "GLACIER", "DEEP_ARCHIVE",
-                        ], help="Optional S3 storage class")
+    parser.add_argument("--no-dry-run", dest="dry_run", action="store_false",
+                        help="Disable dry run (actually upload)")
+    parser.add_argument("--storage-class", choices=[
+        "STANDARD", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING",
+        "REDUCED_REDUNDANCY", "GLACIER", "DEEP_ARCHIVE",
+    ], help="Optional S3 storage class")
+
+    # Transfer tuning
+    parser.add_argument("--multipart-threshold-mb", type=int, help="Multipart threshold in MB (default 8)")
+    parser.add_argument("--multipart-chunksize-mb", type=int, help="Multipart chunk size in MB (default 8)")
+    parser.add_argument("--max-concurrency", type=int, help="Max concurrent threads (default 8)")
+    parser.add_argument("--use-threads", dest="use_threads", action="store_true", help="Use threaded uploads")
+    parser.add_argument("--no-use-threads", dest="use_threads", action="store_false", help="Disable threads")
+
+    # Headers / encryption
+    parser.add_argument("--acl", help="Object ACL (default private)")
+    parser.add_argument("--content-type", dest="content_type", help="Content-Type header")
+    parser.add_argument("--content-encoding", dest="content_encoding", help="Content-Encoding header")
+    parser.add_argument("--sse", help="ServerSideEncryption value (e.g., AES256)")
 
     args = parser.parse_args()
+
+    # Friendly banner
+    if cfg_path.exists():
+        print(f"Using config: {cfg_path}")
+    else:
+        print(f"No config found at: {cfg_path} (using built-ins/CLI)")
 
     src = Path(args.source)
     if not src.exists() or not src.is_dir():
         print(f"Source folder not found: {src}")
-        # Soft assist: try to locate a nearby 'compressed' folder as a fallback
         candidates: List[Path] = []
         project_root = Path(__file__).resolve().parent
         try:
@@ -171,8 +296,7 @@ def main() -> None:
                 print(f"  - {p}")
         sys.exit(1)
 
-    # Create a session **WITHOUT** embedding credentials in code
-    # Credentials are sourced from: --profile, env vars, or default config chain
+    # Create a session WITHOUT embedding credentials in code
     if args.profile:
         session = boto3.Session(profile_name=args.profile, region_name=args.region)
     else:
@@ -181,18 +305,18 @@ def main() -> None:
 
     # Transfer configuration (multipart uploads, concurrency)
     config = TransferConfig(
-        multipart_threshold=8 * 1024 * 1024,      # 8 MB
-        multipart_chunksize=8 * 1024 * 1024,
-        max_concurrency=8,
-        use_threads=True,
+        multipart_threshold=int(args.multipart_threshold_mb) * 1024 * 1024,
+        multipart_chunksize=int(args.multipart_chunksize_mb) * 1024 * 1024,
+        max_concurrency=int(args.max_concurrency),
+        use_threads=bool(args.use_threads),
     )
 
-    # Upload headers and encryption; bucket also enforces SSE-S3 by policy
+    # Upload headers and encryption
     extra_args: Dict[str, str] = {
-        "ACL": "private",
-        "ContentType": "text/csv",
-        "ContentEncoding": "gzip",
-        "ServerSideEncryption": "AES256",
+        "ACL": args.acl,
+        "ContentType": args.content_type,
+        "ContentEncoding": args.content_encoding,
+        "ServerSideEncryption": args.sse,
     }
     if args.storage_class:
         extra_args["StorageClass"] = args.storage_class
