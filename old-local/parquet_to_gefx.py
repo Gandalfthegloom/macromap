@@ -7,7 +7,7 @@ Converts bilateral trade data in parquet format into a GEFX multidigraph through
 import pandas as pd
 import networkx as nx
 import os
-from raw_process import BASE_DIR  # base path for data dirs
+from macromap.raw_process import BASE_DIR  # base path for data dirs
 
 def hs2_parquet_to_mdgraph(pqt_address: str) -> nx.MultiDiGraph:
     """Convert HS2 parquet → MultiDiGraph (keyed by hs2_code)."""

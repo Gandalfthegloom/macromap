@@ -12,7 +12,7 @@ import pydeck as pdk       # Geospatial visualization
 import streamlit as st     # Web app framework
 
 # Project-specific constant: base directory for data files
-from raw_process import BASE_DIR
+from macromap.raw_process import BASE_DIR
 
 # Significance threshold for Serrano's disparity filter
 DISP_FILTER_ALPHA_SIG = 1e-9

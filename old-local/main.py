@@ -3,7 +3,7 @@ MacroMap
 A world trade data visualization project in Python.
 """
 import pandas as pd
-from raw_process import BASE_DIR
+from macromap.raw_process import BASE_DIR
 import os
 import streamlit as st
 

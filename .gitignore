@@ -101,6 +101,7 @@ Thumbs.db
 data/
 gexf/
 parquet/
+metrics/
 
 # Skip ZIP archives
 *.zip

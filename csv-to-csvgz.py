@@ -23,7 +23,7 @@ import pandas as pd
 
 # Gets filepath (from root) of this script's location
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-harmonized_path = os.path.join(BASE_DIR, "data", "zip", "BACI_HS92_V202501")
+file_path = os.path.join(BASE_DIR, "data", "zip", "BACI_HS92_V202501")
 
 # Basic config for csv file scan
 PREFIX = r"BACI_HS92_Y"
@@ -96,7 +96,7 @@ def prompt_for_folder(default_folder: str) -> str:
 
 
 def main():
-    folder = prompt_for_folder(harmonized_path)
+    folder = prompt_for_folder(file_path)
     if not os.path.isdir(folder):
         raise SystemExit(f"Folder not found: {folder}")
 

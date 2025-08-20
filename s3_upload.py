@@ -2,7 +2,7 @@
 s3_upload.py
 Upload BACI .csv.gz files to S3 using safe creds (AWS profile / env),
 matching the MacroMap key structure:
-  raw/baci/hs6/year=<YYYY>/<FILENAME>
+  baci/hs6/year=<YYYY>/<FILENAME>
 
 Highlights
 - No hard-coded credentials. Use --profile or your default AWS config.
@@ -12,6 +12,7 @@ Highlights
 - Dry-run mode to preview without uploading.
 - Flexible source discovery with a sensible default; override via --source.
 - Optional normalization to strict part names: part-0000.csv.gz, etc.
+- NEW: Selective upload by year via --years / --min-year / --max-year (and INI config)
 
 Examples
   # Preview what would be uploaded (uses default bucket/region/source)
@@ -22,10 +23,16 @@ Examples
 
   # Custom source folder and a custom prefix
   python s3_upload.py --source "D:/world trade/macromap/data/zip/BACI_HS92_V202501/compressed" \
-      --prefix raw/baci/hs6/
+      --prefix baci/hs6/
 
   # Normalize filenames to part-0000.csv.gz per year partition
   python s3_upload.py --normalize-parts
+
+  # NEW: Upload only 2013 and 2015–2017
+  python s3_upload.py --years 2013,2015-2017
+
+  # NEW: Upload only within a range (inclusive)
+  python s3_upload.py --min-year 2018 --max-year 2020
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ import re
 import sys
 import argparse
 from pathlib import Path
-from typing import Iterator, Tuple, Dict, List, Optional
+from typing import Iterator, Tuple, Dict, List, Optional, Set
 import configparser
 
 import boto3
@@ -44,10 +51,10 @@ from boto3.s3.transfer import TransferConfig
 # ----------------------------
 # Built-in Defaults (lowest precedence)
 # ----------------------------
-DEFAULT_BUCKET = "macromap-prod-ap-southeast-2"
+DEFAULT_BUCKET = "macromap-raws"
 DEFAULT_REGION = "ap-southeast-2"
 DEFAULT_SOURCE = Path(__file__).resolve().parent / "data" / "zip" / "BACI_HS92_V202501" / "compressed"
-DEFAULT_PREFIX = "raw/baci/hs6/"
+DEFAULT_PREFIX = "baci/hs6/"
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("s3_upload.ini")
 
 # Match BACI_HS92_Y<YEAR>_V....csv.gz
@@ -91,6 +98,54 @@ class ProgressPrinter:
 
 
 # ----------------------------
+# Year filtering helpers (NEW)
+# ----------------------------
+
+def parse_years_expr(expr: str) -> List[int]:
+    """Parse a comma/space-separated list of years and ranges into a sorted list of ints.
+    Examples: "2013", "2013,2015-2017", "2019 2021-2023".
+    """
+    years: Set[int] = set()
+    for token in re.split(r"[\s,]+", expr.strip()):
+        if not token:
+            continue
+        if "-" in token:
+            a, b = token.split("-", 1)
+            try:
+                start, end = int(a), int(b)
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid year range: {token}")
+            if start > end:
+                start, end = end, start
+            for y in range(start, end + 1):
+                years.add(y)
+        else:
+            try:
+                years.add(int(token))
+            except ValueError:
+                raise argparse.ArgumentTypeError(f"Invalid year value: {token}")
+    return sorted(years)
+
+
+def filter_files_by_year(
+    files: List[Tuple[int, Path]],
+    include_years: Optional[Set[int]] = None,
+    min_year: Optional[int] = None,
+    max_year: Optional[int] = None,
+) -> List[Tuple[int, Path]]:
+    def allowed(y: int) -> bool:
+        if include_years is not None and y not in include_years:
+            return False
+        if min_year is not None and y < min_year:
+            return False
+        if max_year is not None and y > max_year:
+            return False
+        return True
+
+    return [(y, p) for (y, p) in files if allowed(y)]
+
+
+# ----------------------------
 # Config loading & precedence
 # ----------------------------
 
@@ -110,7 +165,7 @@ def load_config(config_path: Path) -> dict:
     cp = configparser.ConfigParser()
     cp.read(config_path, encoding="utf-8")
 
-    cfg = {}
+    cfg: Dict[str, Optional[str] | int | bool] = {}
 
     # [aws]
     bucket = cp.get("aws", "bucket", fallback=DEFAULT_BUCKET)
@@ -139,6 +194,11 @@ def load_config(config_path: Path) -> dict:
     content_encoding = cp.get("headers", "content_encoding", fallback="gzip")
     sse = cp.get("headers", "sse", fallback="AES256")
 
+    # [filter]  (NEW)
+    include_years_expr = cp.get("filter", "include_years", fallback="").strip()
+    min_year = cp.get("filter", "min_year", fallback="").strip()
+    max_year = cp.get("filter", "max_year", fallback="").strip()
+
     cfg.update({
         "bucket": bucket,
         "region": region,
@@ -157,6 +217,10 @@ def load_config(config_path: Path) -> dict:
         "content_type": content_type,
         "content_encoding": content_encoding,
         "sse": sse,
+        # filters
+        "include_years_expr": include_years_expr or None,
+        "min_year": int(min_year) if min_year else None,
+        "max_year": int(max_year) if max_year else None,
     })
     return cfg
 
@@ -169,8 +233,8 @@ def build_key(prefix: str, year: int, filename: str, normalize_parts: bool,
               year_to_part_counter: Dict[int, int]) -> str:
     """Build the S3 key under the required partitioning scheme.
 
-    Default: raw/baci/hs6/year=<YEAR>/<FILENAME>
-    If normalize_parts=True: raw/baci/hs6/year=<YEAR>/part-0000.csv.gz, etc.
+    Default: baci/hs6/year=<YEAR>/<FILENAME>
+    If normalize_parts=True: baci/hs6/year=<YEAR>/part-0000.csv.gz, etc.
     """
     prefix = prefix.rstrip("/")
     if normalize_parts:
@@ -237,6 +301,10 @@ def main() -> None:
         content_type=cfg.get("content_type", "text/csv"),
         content_encoding=cfg.get("content_encoding", "gzip"),
         sse=cfg.get("sse", "AES256"),
+        # filters (NEW)
+        include_years_expr=cfg.get("include_years_expr", None),
+        min_year=cfg.get("min_year", None),
+        max_year=cfg.get("max_year", None),
     )
 
     # Full CLI
@@ -244,7 +312,7 @@ def main() -> None:
     parser.add_argument("--region", help="AWS region")
     parser.add_argument("--profile", help="AWS profile name (uses default creds if omitted)")
     parser.add_argument("--source", help="Local folder with .csv.gz files")
-    parser.add_argument("--prefix", help="Key prefix (e.g., raw/baci/hs6/)")
+    parser.add_argument("--prefix", help="Key prefix (e.g., baci/hs6/)")
     parser.add_argument("--normalize-parts", dest="normalize_parts", action="store_true",
                         help="Normalize filenames to part-0000.csv.gz per year")
     parser.add_argument("--no-normalize-parts", dest="normalize_parts", action="store_false",
@@ -272,6 +340,12 @@ def main() -> None:
     parser.add_argument("--content-type", dest="content_type", help="Content-Type header")
     parser.add_argument("--content-encoding", dest="content_encoding", help="Content-Encoding header")
     parser.add_argument("--sse", help="ServerSideEncryption value (e.g., AES256)")
+
+    # Year filters (NEW)
+    parser.add_argument("--years", dest="include_years_expr",
+                        help="Comma/space-separated years or ranges (e.g., '2013,2015-2017')")
+    parser.add_argument("--min-year", dest="min_year", type=int, help="Minimum year to include (inclusive)")
+    parser.add_argument("--max-year", dest="max_year", type=int, help="Maximum year to include (inclusive)")
 
     args = parser.parse_args()
 
@@ -327,7 +401,24 @@ def main() -> None:
         print(f"No matching .csv.gz files found in: {src}")
         sys.exit(0)
 
+    # Apply year filtering (NEW)
+    include_years: Optional[Set[int]] = None
+    if args.include_years_expr:
+        include_years = set(parse_years_expr(args.include_years_expr))
+        if not include_years:
+            print("No valid years parsed from --years.")
+            sys.exit(1)
+
+    files = filter_files_by_year(files, include_years, args.min_year, args.max_year)
+
+    if not files:
+        print("No files remaining after year filtering. Nothing to do.")
+        sys.exit(0)
+
+    # Pretty print the plan
+    years_present = sorted({y for y, _ in files})
     print(f"Found {len(files)} file(s) in: {src}")
+    print(f"Years selected: {years_present}")
     print(f"Target: s3://{args.bucket}/{args.prefix} (region: {args.region})")
     print(f"Overwrite existing: {'YES' if args.overwrite else 'NO'} | Dry-run: {'YES' if args.dry_run else 'NO'}")
 
